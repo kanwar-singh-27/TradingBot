@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Dashboard: Create venv",
+      "type": "shell",
+      "command": "python -m venv .venv",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      }
+    },
+    {
+      "label": "Dashboard: Install dependencies",
+      "type": "shell",
+      "command": ".\\.venv\\Scripts\\python -m pip install -r requirements.txt",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": "Dashboard: Create venv"
+    },
+    {
+      "label": "Dashboard: Run",
+      "type": "shell",
+      "command": ".\\.venv\\Scripts\\python -m streamlit run dashboard.py --server.address 127.0.0.1 --server.port 8501",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": "Dashboard: Install dependencies",
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    }
+  ]
+}
