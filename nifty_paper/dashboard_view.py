@@ -4,6 +4,7 @@ from datetime import datetime
 import math
 
 from .models import Config, IST
+from .diagnostics import finite
 
 
 REASON_DETAILS = {
@@ -187,7 +188,8 @@ def option_rows(snapshot, right=None, expiry=None, strike_distance=None):
             continue
         if expiry and quote.get('expiry') != expiry:
             continue
-        distance = abs(float(quote['strike']) - float(spot)) if spot is not None else math.nan
+        strike, bid, ask = quote.get('strike'), quote.get('bid'), quote.get('ask')
+        distance = abs(strike - spot) if finite(strike) and finite(spot) else math.nan
         if strike_distance is not None and math.isfinite(distance) and distance > strike_distance:
             continue
         rows.append({
@@ -198,7 +200,7 @@ def option_rows(snapshot, right=None, expiry=None, strike_distance=None):
             'lot_size': quote.get('lot_size'),
             'bid': quote.get('bid'),
             'ask': quote.get('ask'),
-            'spread': round(float(quote.get('ask', 0)) - float(quote.get('bid', 0)), 2),
+            'spread': round(ask - bid, 2) if finite(ask) and finite(bid) else None,
             'bid_units': quote.get('bid_units'),
             'ask_units': quote.get('ask_units'),
             'iv': quote.get('iv'),

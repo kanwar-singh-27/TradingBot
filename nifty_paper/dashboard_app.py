@@ -1,6 +1,7 @@
 """Streamlit dashboard for the local NIFTY paper journal."""
 
 from datetime import datetime
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +31,8 @@ from .dashboard_view import (
     timeline_rows,
 )
 from .models import UTC
+from .paths import existing_outputs
+from .replay import diagnose
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
@@ -112,24 +115,25 @@ def render_controls(controller, selected_source, latest_status, all_statuses):
     if REFRESH_CHOICES[refresh_choice]:
         st_autorefresh(interval=REFRESH_CHOICES[refresh_choice], key=f'autorefresh-{selected_source}')
 
-    any_worker_active = any(item.get('worker_lock_held') for item in all_statuses.values())
+    any_worker_active = any(item.get('worker_lock_held') or item.get('alternate_book_blocked') for item in all_statuses.values())
     last_request = st.session_state.get('last_start_request')
     if last_request and not all_statuses.get(last_request[0], {}).get('worker_lock_held'):
         st.session_state.pop('last_start_request', None)
-    default_minutes = 60.0 if selected_source in ('public', 'public_loose') else 1.0
+    control_source = st.sidebar.radio('Paper source', options=SOURCE_OPTIONS, index=SOURCE_OPTIONS.index(selected_source) if selected_source in SOURCE_OPTIONS else 0, horizontal=True)
+    default_minutes = 60.0 if control_source in ('public', 'public_loose') else 1.0
     with st.sidebar.form('paper-start-form'):
-        control_source = st.radio('Paper source', options=SOURCE_OPTIONS, index=SOURCE_OPTIONS.index(selected_source) if selected_source in SOURCE_OPTIONS else 0, horizontal=True)
         duration = st.number_input('Duration minutes', min_value=0.01, max_value=375.0, value=default_minutes, step=1.0)
         capital = st.number_input('Virtual capital (INR)', min_value=1.0, max_value=1_000_000_000.0, value=default_virtual_capital(control_source), step=50_000.0, key=f'virtual-capital-{control_source}')
+        diagnostic = st.checkbox('Diagnostic only — no positions', value=False)
         source_status = all_statuses[control_source]
         start_disabled = any_worker_active or source_status.get('state', {}).get('position') is not None
         start_clicked = st.form_submit_button('Start paper session', disabled=start_disabled, type='primary')
         if start_clicked:
-            request_key = (control_source, duration, capital)
+            request_key = (control_source, duration, capital, diagnostic)
             if st.session_state.get('last_start_request') == request_key:
                 st.warning('Duplicate start request blocked until status changes.')
             else:
-                result = controller.start(control_source, duration_minutes=duration, capital=capital)
+                result = controller.start(control_source, duration_minutes=duration, capital=capital, diagnostic=diagnostic)
                 st.session_state['last_start_request'] = request_key
                 st.session_state['last_start_result'] = result
                 st.success(f"Start requested for {control_source} session {result.get('pid', 'spawned worker')}.")
@@ -150,6 +154,8 @@ def render_controls(controller, selected_source, latest_status, all_statuses):
         st.session_state['last_source_check'] = result
 
     st.sidebar.caption('Controls invoke the fixed paper CLI with approved project directories only. Refreshing this page never starts a worker.')
+    if any(item.get('alternate_book_blocked') for item in all_statuses.values()):
+        st.sidebar.warning('New starts blocked: an alternate journal has an active worker or unresolved position. Select that journal to inspect it.')
 
 
 def render_status_messages(latest_status):
@@ -267,6 +273,7 @@ def render_timeline(session):
 
 
 def render_forecast(session):
+    render_diagnostics(session)
     metrics = selection_metrics(session)
     st.warning('Unvalidated, uncalibrated research baseline. These outputs do not establish an edge.')
     left, right = st.columns(2)
@@ -299,6 +306,56 @@ def render_forecast(session):
     if metrics['top_candidates']:
         st.markdown('#### Top Candidates By Score')
         st.dataframe(pd.DataFrame(metrics['top_candidates']), width='stretch', hide_index=True)
+
+
+def render_diagnostics(session):
+    st.markdown('### Decision Pipeline')
+    report = session.get('diagnostics') or {}
+    cache_key = f"diagnostic-replay-{session.get('output')}-{session.get('id')}"
+    if not report.get('summary'):
+        st.info(report.get('notice', 'This older session has no persisted candidate traces.'))
+        if report.get('recorded_reasons'):
+            st.write({'recorded_session_reasons': report['recorded_reasons']})
+        if st.button('Replay stored snapshots (no trades)', disabled=not (session.get('output') and session.get('id'))):
+            try:
+                st.session_state[cache_key] = diagnose(session['output'], session['id'])
+            except (ValueError, RuntimeError, OSError) as exc:
+                st.error(f'Diagnostic replay unavailable: {exc}')
+        report = st.session_state.get(cache_key, report)
+    summary = report.get('summary')
+    if not summary:
+        return
+    if report.get('recorded_reasons'):
+        st.write({'all_recorded_session_reasons_including_no_data': report['recorded_reasons']})
+    if report.get('notice'):
+        st.caption(report['notice'])
+    if report.get('status') == 'OFFLINE_DIAGNOSTIC_REPLAY':
+        st.warning(report['notice'])
+    st.caption(summary['count_unit'])
+    st.dataframe(pd.DataFrame([{'stage': key, 'candidate_observations': value} for key, value in summary['funnel'].items()]), width='stretch', hide_index=True)
+    st.write({'trades_taken_in_these_evaluations': summary['trades_taken'], 'execution_outcomes': summary['actions']})
+    st.info(summary['final_stage_explanation'])
+    failures = [{'code': key, 'first_failure_count': value, 'all_failure_count': summary['all_failed_gates'].get(key, 0)}
+                for key, value in summary['first_failed_gates'].items()]
+    failures += [{'code': key, 'first_failure_count': 0, 'all_failure_count': value}
+                 for key, value in summary['all_failed_gates'].items() if key not in summary['first_failed_gates']]
+    st.dataframe(pd.DataFrame(failures), width='stretch', hide_index=True)
+    st.markdown('#### Score and Uncertainty')
+    st.json({'score_INR': summary['score_statistics'], 'unweighted_uncertainty_INR': summary['uncertainty_statistics']})
+    with st.expander('Near misses — no automatic threshold changes'):
+        st.json(summary['near_misses'])
+    latest = report.get('latest') or {}
+    candidates = latest.get('candidates') or []
+    if candidates:
+        selected = st.selectbox('Candidate decision trace', options=list(range(len(candidates))),
+                                format_func=lambda i: f"{i+1}. {candidates[i]['instrument']} | {candidates[i]['final_decision']}")
+        trace = candidates[selected]
+        st.write({k: v for k, v in trace.items() if k not in ('validations', 'stages')})
+        st.dataframe(pd.DataFrame([{'gate': k, **v} for k, v in trace['validations'].items()]).astype(str), width='stretch', hide_index=True)
+    for limitation in latest.get('limitations', []):
+        st.caption(limitation)
+    st.download_button('Download diagnostic report', json.dumps(report, indent=2, allow_nan=False),
+                       file_name='paper-diagnostics.json', mime='application/json')
 
 
 def render_positions_and_risk(session):
@@ -427,6 +484,23 @@ def main():
     apply_theme()
     reader = make_reader()
     controller = make_controller()
+
+    overrides = {}
+    needs_choice = False
+    for source in SOURCE_OPTIONS:
+        books = existing_outputs(WORKSPACE_ROOT, source)
+        if len(books) > 1:
+            st.sidebar.warning(f'Multiple {source} journals exist. They are separate books, not merged.')
+            chosen = st.sidebar.selectbox(f'{source} journal', options=books, index=None, placeholder='Choose the journal to inspect', format_func=lambda p: str(p.relative_to(WORKSPACE_ROOT)))
+            if chosen is None:
+                needs_choice = True
+            else:
+                overrides[source] = chosen
+    if needs_choice:
+        st.info('Choose each ambiguous journal above before viewing or controlling a paper session. No books are merged or reset.')
+        return
+    reader.output_overrides = overrides
+    controller.output_overrides = overrides
 
     selected_source = st.sidebar.radio('Source view', options=SOURCE_OPTIONS, horizontal=True, key='selected_source')
     try:

@@ -3,16 +3,37 @@
 from dataclasses import asdict
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
 import uuid
 
 from .models import UTC
+from .diagnostics import clean
 
 
 def encoded(value):
     return json.dumps(value, default=lambda x: x.isoformat() if isinstance(x, datetime) else str(x), allow_nan=False)
+
+
+def observation_payload(snapshot):
+    raw = asdict(snapshot)
+    invalid = {}
+    def inspect(value, path):
+        if isinstance(value, float) and not math.isfinite(value):
+            invalid[path] = str(value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                inspect(item, f'{path}.{key}')
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                inspect(item, f'{path}[{index}]')
+    inspect(raw, 'snapshot')
+    result = clean(raw)
+    if invalid:
+        result['nonfinite_values_serialized_as_null'] = invalid
+    return result
 
 
 class RunLock:
@@ -83,6 +104,15 @@ class Store:
                 last_spot REAL,
                 mark_status TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS decision_reports (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                decision_id TEXT NOT NULL,
+                recorded TEXT NOT NULL,
+                source_at TEXT,
+                payload TEXT NOT NULL,
+                UNIQUE(session_id, decision_id)
+            );
         ''')
 
     def create(self, config):
@@ -96,15 +126,18 @@ class Store:
                             (session, now, now, os.getpid(), encoded(asdict(config)), encoded({'status': 'STARTING'})))
         return session
 
-    def save(self, session, state, events=(), snapshot=None):
+    def save(self, session, state, events=(), snapshot=None, decision=None):
         now = datetime.now(UTC).isoformat()
         with self.db:
             self.db.execute('UPDATE sessions SET heartbeat=?, state=? WHERE id=?', (now, encoded(state), session))
             self.db.executemany('INSERT INTO events(session_id,recorded,payload) VALUES (?,?,?)',
                                 [(session, now, encoded(event)) for event in events])
+            if decision is not None:
+                self.db.execute('INSERT OR IGNORE INTO decision_reports(session_id,decision_id,recorded,source_at,payload) VALUES (?,?,?,?,?)',
+                                (session, decision['decision_id'], now, decision['source_as_of'], encoded(decision)))
             if snapshot:
                 self.db.execute('INSERT INTO snapshots(session_id,recorded,payload) VALUES (?,?,?)',
-                                (session, now, encoded(asdict(snapshot))))
+                                (session, now, encoded(observation_payload(snapshot))))
                 self.db.execute(
                     '''INSERT INTO equity_samples(
                            session_id, recorded, source_at, equity, equity_lower_bound,

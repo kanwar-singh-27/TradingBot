@@ -10,6 +10,9 @@ import sys
 
 from .feeds import PublicFeed, DemoFeed, KiteFeed
 from .models import Config, UTC, is_public_source, market_open
+from .paths import resolve_output
+from .diagnostics import journal_diagnostics
+from .replay import diagnose
 from .runtime import run
 from .store import RunLock, Store, encoded
 
@@ -26,10 +29,15 @@ def parser():
         item.add_argument('--poll-seconds', type=float)
         item.add_argument('--capital', type=float, default=1_000_000)
         item.add_argument('--output', type=Path)
+        item.add_argument('--diagnostic', action='store_true', help='Evaluate entries without creating intents, positions or charges')
     for command in ('status', 'report', 'stop', 'check'):
         item = commands.add_parser(command)
         item.add_argument('--source', choices=('public', 'public_loose', 'demo', 'kite'), default='public')
         item.add_argument('--output', type=Path)
+    item = commands.add_parser('diagnose', help='Read-only diagnostic replay of a recorded zero-entry session; never fetches data')
+    item.add_argument('--source', choices=('public', 'public_loose', 'demo'), default='public')
+    item.add_argument('--output', type=Path)
+    item.add_argument('--session-id')
     return result
 
 
@@ -55,6 +63,7 @@ def inspect(output, include_events=False):
         latest['output'] = str(output)
         if include_events:
             latest['events'] = store.events(latest['id'], 100)
+            latest['diagnostics'] = journal_diagnostics(store.db, latest['id'])
         return latest
     finally:
         store.close()
@@ -69,6 +78,8 @@ def launch(config, output):
     args = [sys.executable, '-I', str(ROOT/'paper.py'), '_worker', '--source', config.source,
             '--duration-minutes', str(config.duration_minutes), '--poll-seconds', str(config.poll_seconds),
             '--capital', str(config.capital), '--output', str(output)]
+    if config.diagnostic:
+        args.append('--diagnostic')
     # Do not pass broker/AI secrets from the editor environment into this subprocess.
     allowed = ('SYSTEMROOT', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'HOME', 'USERPROFILE', 'LOCALAPPDATA')
     environment = {key: os.environ[key] for key in allowed if key in os.environ}
@@ -86,12 +97,15 @@ def launch(config, output):
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    output = (args.output or ROOT/'runtime'/args.source).resolve()
     try:
+        output = resolve_output(ROOT, args.source, args.output)
+        if args.command == 'diagnose':
+            print(encoded(diagnose(output, args.session_id)))
+            return 0
         if args.command in ('start', 'run', '_worker'):
             config = Config(source=args.source, duration_minutes=args.duration_minutes,
                             poll_seconds=args.poll_seconds if args.poll_seconds is not None else 60 if is_public_source(args.source) else 1,
-                            capital=args.capital)
+                            capital=args.capital, diagnostic=args.diagnostic)
             if args.command == 'start':
                 print(encoded(launch(config, output)))
                 return 0

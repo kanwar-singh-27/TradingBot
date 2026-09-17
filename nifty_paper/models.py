@@ -31,8 +31,11 @@ class Config:
     fee_per_order: float = 25
     fee_rate: float = .002
     slippage_fraction: float = .001
+    diagnostic: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.diagnostic, bool):
+            raise ValueError('diagnostic must be a boolean')
         if self.source not in ('public', 'public_loose', 'demo'):
             raise ValueError('Only public, public_loose, or demo paper sources are permitted; no live mode exists')
         bounds = {
@@ -90,5 +93,5 @@ class Snapshot:
 def market_open(at, entries=False):
     local = at.astimezone(IST)
     minutes = local.hour * 60 + local.minute
-    lower, upper = (570, 870) if entries else (555, 930)
+    lower, upper = (570, 930) if entries else (555, 930)
     return local.weekday() < 5 and lower <= minutes < upper

@@ -14,8 +14,77 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / 'dashboard.py'
 
 
+def diagnostic_panel_fixture(report):
+    from nifty_paper.dashboard_app import render_diagnostics
+    render_diagnostics({'diagnostics': report})
+
+
 @unittest.skipIf(AppTest is None, 'streamlit not installed yet')
 class DashboardUiTests(unittest.TestCase):
+    def setUp(self):
+        # Ordinary UI tests must not inspect the user's runtime books.
+        outputs = patch('nifty_paper.dashboard_app.existing_outputs', return_value=[])
+        outputs.start()
+        self.addCleanup(outputs.stop)
+
+    def test_ambiguous_journals_require_explicit_choice(self):
+        reader, controller = Mock(), Mock()
+        books = [ROOT/'runtime/public-loose', ROOT/'runtime/public_loose']
+        with patch('nifty_paper.dashboard_app.existing_outputs', side_effect=lambda root, source: books if source == 'public_loose' else []), patch('nifty_paper.dashboard_app.make_reader', return_value=reader), patch('nifty_paper.dashboard_app.make_controller', return_value=controller):
+            app = AppTest.from_file(str(APP)).run()
+            selector = next(s for s in app.selectbox if s.label == 'public_loose journal')
+            self.assertIsNone(selector.value)
+            self.assertFalse(any(b.label == 'Start paper session' for b in app.button))
+            controller.status.assert_not_called()
+
+    def test_source_switch_updates_visible_capital_before_submission(self):
+        reader = Mock()
+        reader.list_sessions.return_value = []
+        reader.load_latest.return_value = {'status': 'NOT_STARTED', 'source': 'public', 'output': 'runtime/public'}
+        controller = Mock()
+        controller.status.return_value = {'status': 'NOT_STARTED', 'worker_lock_held': False}
+        controller.start.return_value = {'pid': 123, 'source': 'public_loose'}
+        with patch('nifty_paper.dashboard_app.make_reader', return_value=reader), patch('nifty_paper.dashboard_app.make_controller', return_value=controller):
+            app = AppTest.from_file(str(APP)).run()
+            source = next(r for r in app.radio if r.label == 'Paper source')
+            self.assertFalse(bool(source.proto.form_id), 'Source must rerun before submitting capital')
+            source.set_value('public_loose').run()
+            capital = next(n for n in app.number_input if n.label == 'Virtual capital (INR)')
+            self.assertEqual(capital.value, 4_000_000)
+            capital.set_value(3_500_000)
+            next(b for b in app.button if b.label == 'Start paper session').click().run()
+            self.assertEqual(len(app.exception), 0)
+        controller.start.assert_called_once_with('public_loose', duration_minutes=60.0, capital=3_500_000.0, diagnostic=False)
+
+    def test_diagnostics_panel_shows_funnel_and_score_statistics(self):
+        from nifty_paper import dashboard_app
+        self.assertTrue(hasattr(dashboard_app, 'render_diagnostics'), 'Missing diagnostics panel')
+        report = {'status': 'AVAILABLE', 'summary': {
+            'count_unit': 'candidate observations', 'funnel': {'discovered': 2, 'after_risk': 1, 'after_score': 1},
+            'trades_taken': 0, 'first_failed_gates': {'RISK_TOO_HIGH': 1}, 'all_failed_gates': {'RISK_TOO_HIGH': 1},
+            'score_statistics': {'count': 2}, 'uncertainty_statistics': {'count': 2},
+            'actions': {}, 'near_misses': [], 'final_stage_explanation': 'Await a later valid quote.'},
+            'latest': {'candidates': [], 'limitations': ['Chain timestamp only']}}
+        app = AppTest.from_function(diagnostic_panel_fixture, args=(report,)).run()
+        self.assertEqual(len(app.exception), 0)
+        text = '\n'.join(m.value for m in app.markdown)
+        self.assertIn('Decision Pipeline', text)
+        self.assertIn('Score and Uncertainty', text)
+        self.assertGreaterEqual(len(app.dataframe), 2)
+
+    def test_diagnostics_panel_renders_real_candidate_gates(self):
+        from nifty_paper.engine import Engine
+        from nifty_paper.feeds import DemoFeed
+        from nifty_paper.models import Config
+        engine = Engine(Config(source='demo', poll_seconds=1, diagnostic=True))
+        snap = DemoFeed().fetch()
+        engine.step(snap, snap.at)
+        report = {'status': 'AVAILABLE', 'summary': engine.last_decision['summary'], 'latest': engine.last_decision}
+        app = AppTest.from_function(diagnostic_panel_fixture, args=(report,)).run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertTrue(any(s.label == 'Candidate decision trace' for s in app.selectbox))
+        self.assertGreaterEqual(len(app.dataframe), 3)
+
     def test_empty_state_renders_without_starting_a_worker(self):
         from nifty_paper.dashboard_app import main
 

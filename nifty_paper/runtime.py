@@ -75,7 +75,7 @@ def run(config, output):
                                 engine.state['source_received_at'] = snapshot.received_at.isoformat()
                                 engine.state['source_url'] = snapshot.source
                                 engine.state['last_error'] = None
-                                store.save(session, engine.state, events, snapshot)
+                                store.save(session, engine.state, events, snapshot, decision=engine.last_decision)
                                 failures = 0
                             except FeedError as exc:
                                 failures += 1

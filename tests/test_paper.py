@@ -9,7 +9,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 READY = (ROOT / 'nifty_paper' / 'engine.py').exists()
 if READY:
-    from nifty_paper.models import Config, Quote, Snapshot, UTC, IST
+    from nifty_paper.models import Config, Quote, Snapshot, UTC, IST, market_open
     from nifty_paper.feeds import parse_chain, parse_lots, parse_yahoo, FeedError, DemoFeed
     from nifty_paper.kite_auth import build_login_url, exchange_request_token, session_environment
     from nifty_paper.strategy import option_value, select_candidate
@@ -28,21 +28,20 @@ class PaperTests(unittest.TestCase):
         self.at = datetime(2026, 9, 17, 5, 0, tzinfo=timezone.utc)
         self.cfg = Config(source='demo', duration_minutes=60, poll_seconds=1)
 
-    def snapshot(self, offset=0, bid=99.0, ask=100.0, **changes):
+    def snapshot(self, offset=0, bid=99.5, ask=100.0, **changes):
         at = self.at + timedelta(seconds=offset)
-        quote = Quote('NIFTY-TEST-CE', 'CE', 23000, at.replace(hour=10) + timedelta(days=5),
+        quote = Quote('NIFTY-TEST-CE', 'CE', 23000, self.at.replace(hour=10) + timedelta(days=5),
                       bid, ask, 650, 650, 65, .15)
         bars = tuple((at - timedelta(minutes=60-i), 23000 * (1.0001 ** i)) for i in range(61))
         return Snapshot(at, at, bars[-1][1], bars, (replace(quote, **changes),), 'fixture', 'DEMO_SYNTHETIC')
 
     def enter(self, engine):
         first = self.snapshot()
-        with patch('nifty_paper.engine.select_candidate', return_value=(first.quotes[0], {'net_ev_rupees': 100})):
-            engine.step(first, first.received_at)
-            self.assertIsNone(engine.state['position'])
-            self.assertEqual(engine.state['pending']['side'], 'BUY')
-            second = self.snapshot(60)
-            engine.step(second, second.received_at)
+        engine.step(first, first.received_at)
+        self.assertIsNone(engine.state['position'])
+        self.assertEqual(engine.state['pending']['side'], 'BUY')
+        second = self.snapshot(60)
+        engine.step(second, second.received_at)
         return second
 
     def test_config_rejects_live_nan_and_fast_public_poll(self):
@@ -52,6 +51,11 @@ class PaperTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 Config(**kwargs)
         Config(source='public_loose', duration_minutes=60, poll_seconds=60)
+
+    def test_public_market_close_is_3_30_ist(self):
+        self.assertTrue(market_open(datetime(2026, 9, 17, 9, 30, tzinfo=IST), entries=True))
+        self.assertTrue(market_open(datetime(2026, 9, 17, 15, 29, tzinfo=IST), entries=True))
+        self.assertFalse(market_open(datetime(2026, 9, 17, 15, 30, tzinfo=IST), entries=True))
 
     def test_public_loose_can_select_candidate_when_conservative_public_stays_in_cash(self):
         bars = tuple((self.at - timedelta(minutes=60-i), 23000 / (1.00005 ** (60 - i))) for i in range(61))
@@ -220,13 +224,13 @@ class PaperTests(unittest.TestCase):
             self.assertIsNone(engine.state['pending'])
             self.assertEqual(engine.state['reason'], 'STALE_OR_FUTURE_DATA')
 
-    def test_public_snapshot_allows_one_poll_interval_of_extra_age(self):
+    def test_public_snapshot_does_not_extend_max_age_by_poll_interval(self):
         engine = Engine(replace(self.cfg, source='public', poll_seconds=60))
         snap = replace(self.snapshot(), kind='PUBLIC_SNAPSHOT_SIMULATION')
         snap = replace(snap, at=snap.at.replace(hour=4, minute=0), received_at=snap.at.replace(hour=4, minute=1, second=45))
         with patch('nifty_paper.engine.select_candidate', return_value=(None, {'reason': 'NO_EDGE'})):
             engine.step(snap, snap.at + timedelta(seconds=105))
-        self.assertEqual(engine.state['reason'], 'NO_EDGE')
+        self.assertEqual(engine.state['reason'], 'STALE_OR_FUTURE_DATA')
 
     def test_invalid_quotes_never_fill(self):
         for changes in ({'bid': -1}, {'ask': 0}, {'bid': 102}, {'iv': float('nan')}, {'ask_units': 0}):
@@ -307,12 +311,14 @@ class PaperTests(unittest.TestCase):
 
     def test_pending_entry_is_cancelled_outside_public_entry_window(self):
         engine = Engine(replace(self.cfg, source='public', poll_seconds=60, capital=4000000))
-        snap = replace(self.snapshot(), kind='PUBLIC_SNAPSHOT_SIMULATION')
-        snap = replace(snap, at=snap.at.replace(hour=8, minute=59), received_at=snap.at.replace(hour=8, minute=59))
+        snap = replace(self.snapshot(offset=239*60), kind='PUBLIC_SNAPSHOT_SIMULATION',
+                      at=datetime(2026, 9, 17, 15, 29, tzinfo=IST),
+                      received_at=datetime(2026, 9, 17, 15, 29, tzinfo=IST))
         with patch('nifty_paper.engine.select_candidate', return_value=(snap.quotes[0], {})):
             engine.step(snap, snap.at)
             self.assertIsNotNone(engine.state['pending'])
-            later = replace(snap, at=snap.at+timedelta(minutes=1), received_at=snap.at+timedelta(minutes=1))
+            later = replace(snap, at=datetime(2026, 9, 17, 15, 30, tzinfo=IST),
+                            received_at=datetime(2026, 9, 17, 15, 30, tzinfo=IST))
             engine.step(later, later.at)
         self.assertIsNone(engine.state['position'])
         self.assertIsNone(engine.state['pending'])

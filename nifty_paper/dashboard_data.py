@@ -5,23 +5,18 @@ import json
 from pathlib import Path
 import sqlite3
 
+from .diagnostics import journal_diagnostics
+from .paths import SOURCE_OUTPUTS, resolve_output
 
-SOURCE_OUTPUTS = {
-    'public': Path('runtime/public'),
-    'public_loose': Path('runtime/public-loose'),
-    'demo': Path('runtime/validation-demo'),
-}
 
 
 class JournalReader:
     def __init__(self, workspace_root):
         self.workspace_root = Path(workspace_root)
+        self.output_overrides = {}
 
     def output_root(self, source):
-        try:
-            return (self.workspace_root / SOURCE_OUTPUTS[source]).resolve()
-        except KeyError as exc:
-            raise ValueError('Unsupported paper source') from exc
+        return resolve_output(self.workspace_root, source, self.output_overrides.get(source))
 
     def db_path(self, source):
         return self.output_root(source) / 'paper.sqlite3'
@@ -135,6 +130,7 @@ class JournalReader:
             session['snapshots'] = self._snapshots(connection, session_id, snapshot_limit)
             session['equity_history_status'] = status
             session['equity_history'] = equity_history
+            session['diagnostics'] = journal_diagnostics(connection, session_id)
             session['source'] = source
             session['output'] = str(self.output_root(source))
             return session

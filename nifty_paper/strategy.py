@@ -24,6 +24,25 @@ def option_value(spot, strike, years, vol, right):
     return strike * normal.cdf(-d2) - spot * normal.cdf(-d1)
 
 
+def scenario_values(snap, quote, config, forecast):
+    """Unrounded research values; these theoretical values are NEVER fills."""
+    mu, scale = forecast['expected_log_return'], forecast['return_std']
+    days = (quote.expiry - snap.at).total_seconds() / 86400
+    years = max(0, days/365 - config.hold_minutes/(365*1440))
+    entry = quote.ask * (1 + config.slippage_fraction)
+    normal = NormalDist()
+    zs = [normal.inv_cdf((i + .5) / 41) for i in range(41)]
+    scenario_means = []
+    for iv_change in (-.02, 0, .02):
+        prices = [option_value(snap.spot * math.exp(mu+scale*z), quote.strike, years,
+                               max(.01, quote.iv+iv_change), quote.right) for z in zs]
+        exit_price = max(0, mean(prices) - (quote.ask-quote.bid)/2) * (1-config.slippage_fraction)
+        pnl = (exit_price-entry)*quote.lot_size - config.fee(entry*quote.lot_size) - config.fee(exit_price*quote.lot_size)
+        scenario_means.append(pnl)
+    uncertainty = snap.spot * forecast['uncertainty_move'] * quote.lot_size
+    return candidate_score(config.source, scenario_means, uncertainty), scenario_means, uncertainty
+
+
 def select_candidate(snap, config):
     bars = [(t, p) for t, p in snap.bars if t <= snap.at and t.astimezone(IST).date() == snap.at.astimezone(IST).date()]
     if len(bars) < 31 or (snap.at - bars[-1][0]).total_seconds() > 180:
@@ -40,13 +59,13 @@ def select_candidate(snap, config):
     mu, scale = drift * horizon, sigma * math.sqrt(horizon)
     uncertainty_move = 1.96 * sigma / math.sqrt(len(returns)) * horizon
     normal = NormalDist()
-    zs = [normal.inv_cdf((i + .5) / 41) for i in range(41)]
     best, best_score = None, 0.0
     candidate_counts = {'total': len(snap.quotes), 'valid': 0, 'days_window': 0,
                         'strike_window': 0, 'spread_ok': 0, 'depth_ok': 0, 'positive_score': 0}
     top_candidates = []
     details = {'reason': 'CASH_BETTER_AFTER_COSTS', 'model': 'shrunk-normal-baseline-v1-UNVALIDATED',
                'horizon_minutes': horizon, 'expected_log_return': mu, 'return_std': scale,
+               'uncertainty_move': uncertainty_move,
                'p_up_model_only': normal.cdf(mu / scale), 'calibrated': False,
                'candidate_counts': candidate_counts, 'top_candidates': top_candidates}
     for q in snap.quotes:
@@ -73,17 +92,8 @@ def select_candidate(snap, config):
             candidate_counts['depth_ok'] += 1
         else:
             continue
-        entry = q.ask * (1 + config.slippage_fraction)
-        years = max(0, days/365 - horizon/(365*1440))
-        scenario_means = []
-        for iv_change in (-.02, 0, .02):
-            prices = [option_value(snap.spot * math.exp(mu+scale*z), q.strike, years,
-                                   max(.01, q.iv+iv_change), q.right) for z in zs]
-            exit_price = max(0, mean(prices) - (q.ask-q.bid)/2) * (1-config.slippage_fraction)
-            pnl = (exit_price-entry)*q.lot_size - config.fee(entry*q.lot_size) - config.fee(exit_price*q.lot_size)
-            scenario_means.append(pnl)
         # Bound delta magnitude by one for a conservative mean-estimation deduction.
-        score = candidate_score(config.source, scenario_means, snap.spot*uncertainty_move*q.lot_size)
+        score, scenario_means, uncertainty = scenario_values(snap, q, config, details)
         top_candidates.append({
             'instrument': q.instrument,
             'right': q.right,

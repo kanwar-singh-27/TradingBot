@@ -11,6 +11,27 @@ SCRIPT = ROOT / 'paper.py'
 
 
 class RunnerTests(unittest.TestCase):
+    def test_cli_diagnostic_demo_stays_flat_and_reports_traces(self):
+        with TemporaryDirectory() as directory:
+            cmd = [sys.executable, '-I', str(SCRIPT), 'run', '--source', 'demo', '--diagnostic',
+                   '--duration-minutes', '.05', '--poll-seconds', '.05', '--output', directory]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([sys.executable, '-I', str(SCRIPT), 'report', '--source', 'demo', '--output', directory], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report['state']['entries'], 0)
+            self.assertEqual(report['state']['fees_paid'], 0)
+            self.assertIsNone(report['state']['position'])
+            self.assertEqual(report['diagnostics']['status'], 'AVAILABLE')
+            self.assertGreater(report['diagnostics']['summary']['funnel']['after_score'], 0)
+            self.assertEqual(report['diagnostics']['summary']['trades_taken'], 0)
+            result = subprocess.run([sys.executable, '-I', str(SCRIPT), 'diagnose', '--source', 'demo', '--output', directory], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            replay = json.loads(result.stdout)
+            self.assertEqual(replay['status'], 'OFFLINE_DIAGNOSTIC_REPLAY')
+            self.assertEqual(replay['summary']['trades_taken'], 0)
+
     def test_cli_exists(self):
         self.assertTrue(SCRIPT.exists(), 'Missing duration-bounded paper CLI')
 
